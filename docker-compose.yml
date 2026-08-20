@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: traffic_bot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - ${DB_PORT}:${DB_PORT}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./inti_schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - traffic-bot-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: traffic-bot-app
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      TZ: ${DEFAULT_TZ:-UTC}
+      XUI_DB_PATH: /panel/x-ui.db
+      OWN_DB_PATH: /app/data/usage.db
+
+    volumes:
+      - app-data:/app/data
+      - app-logs:/app/logs
+
+      - ${XUI_DB_HOST_PATH:-/etc/x-ui}:/panel:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - traffic-bot-net
+    
+volumes:
+  postgres_data:
+    name: traffic-bot-pg-data
+  app-data:
+    name: traffic-bot-app-data
+  app-logs:
+    name: traffic-bot-app-logs
+
+networks:
+  traffic-bot-net:
+    driver: bridge

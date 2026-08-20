@@ -1,0 +1,33 @@
+#Git & .env
+.git
+.gitignore
+.env
+
+# DB & logs
+*.db
+*.db-shm
+*.db-wal
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+traffic-bot
+bin/
+dist/
+
+# Docker
+docker-compose.yml
+Dockerfile
+
+#Something else
+README.md
+*.md

@@ -1,0 +1,203 @@
+# 🚦 Traffic Bot — мониторинг трафика 3x-ui с Telegram-ботом
+
+Сервис собирает статистику трафика пользователей панели **3x-ui** (Xray),
+сохраняет историю в **PostgreSQL** и отдаёт отчёты за день / неделю / месяц
+через **Telegram-бота**.
+
+## Архитектура
+
+```
+┌──────────────┐  poll (read-only)  ┌──────────────┐  дельты   ┌────────────┐
+│  3x-ui       │ ─────────────────► │ traffic-bot  │ ────────► │ PostgreSQL │
+│  (SQLite)    │                    │  (Go)        │           │            │
+└──────────────┘                    └──────┬───────┘           └─────┬──────┘
+                                           │ /bind /usage            │ SUM за период
+                                           ▼                         │
+                                    ┌──────────────┐ ◄───────────────┘
+                                    │ Telegram bot │
+                                    └──────────────┘
+```
+
+Принцип работы:
+
+1. Раз в N минут сервис читает текущие счётчики `up/down` каждого клиента из базы 3x-ui.
+2. Сравнивает с последним сохранённым значением (`state`) и считает **дельту**.
+3. Дельта сохраняется в таблицу `usage` с меткой времени.
+4. Отчёты за периоды считаются суммированием дельт (`SUM`) за нужный диапазон времени.
+5. Обнаруживается сброс счётчика (значение уменьшилось) — дельтой считается текущее значение, пишется warning в лог.
+
+## Расчётные периоды
+
+| Период          | Границы                                                                        |
+|-----------------|--------------------------------------------------------------------------------|
+| День            | с 00:00 текущего дня до 00:00 следующего (для «сегодня» — до текущего момента) |
+| Неделя          | с понедельника 00:00 до конца недели                                           |
+| Месяц (биллинг) | **с 30-го числа** предыдущего месяца по 30-е число текущего                    |
+
+Таймзона расчёта — `TZ` контейнера (задаётся через `DEFAULT_TZ`).
+
+## Структура проекта
+
+```
+.
+├── main.go             # приложение (collector + telegram bot)
+├── Dockerfile          # multi-stage сборка (без CGO)
+├── docker-compose.yml  # postgres + app
+├── inti_schema.sql     # схема БД (выполняется при первом старте postgres)
+├── .gitignore
+├── Makefile
+└── go.mod / go.sum
+```
+
+## Требования
+
+- Docker + Docker Compose
+- Установленная панель 3x-ui на том же хосте (нужна её SQLite-база)
+- Telegram-бот, созданный через @BotFather
+
+## Быстрый старт
+
+### 1. Конфигурация
+
+Создайте `.env`:
+
+```env
+# Telegram
+BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ
+
+# PostgreSQL
+DB_USER=trafficbot
+DB_PASSWORD=strong_password
+DB_NAME=trafficbot
+DB_PORT=5432
+
+# Путь к каталогу с базой 3x-ui НА ХОСТЕ (смонтируется в /panel)
+XUI_DB_HOST_PATH=/etc/x-ui
+
+# Таймзона отчётов
+DEFAULT_TZ=Europe/Moscow
+```
+
+### 2. Сборка и запуск
+
+```bash
+make docker-up            # = docker compose up -d --build
+make docker-status        # = docker compose ps
+```
+
+или вручную:
+
+```bash
+docker compose up -d --build
+```
+
+### 3. Проверка
+
+```bash
+# Таблицы созданы?
+make docker-check
+
+# Приложение подключилось?
+make docker-app-logs
+```
+
+Ожидаемые строки в логе:
+
+```
+Connected to PostgreSQL
+Connected to 3x-ui SQLite
+Telegram bot authorized
+```
+
+## Команды бота
+
+| Команда                   | Описание                                    |
+|---------------------------|---------------------------------------------|
+| `/start`                  | справка                                     |
+| `/bind email@example.com` | привязать Telegram-чат к пользователю 3x-ui |
+| `/usage`                  | отчёт за день, неделю и биллинг-месяц       |
+
+Привязка — это связь `tg_chat_id → user_key (email из 3x-ui)` в таблице
+`bindings`. Без неё бот не знает, чью статистику показывать.
+
+## Схема БД (PostgreSQL)
+
+Создаётся автоматически из `inti_schema.sql` **только при первом запуске**
+(пустой volume).
+
+- `state` — последние известные счётчики каждого пользователя (для расчёта дельт);
+- `usage` — история дельт трафика (`user_key, ts, up, down`);
+- `bindings` — привязки Telegram-чатов к пользователям.
+
+Если изменили схему — пересоздайте volume:
+
+```bash
+make docker-down
+docker compose up -d --build
+```
+
+## Переменные окружения
+
+| Переменная                            | Откуда  | Описание                                               |
+|---------------------------------------|---------|--------------------------------------------------------|
+| `BOT_TOKEN`                           | `.env`  | токен Telegram-бота                                    |
+| `DB_USER` / `DB_PASSWORD` / `DB_NAME` | `.env`  | креды PostgreSQL                                       |
+| `DB_PORT`                             | `.env`  | порт PostgreSQL для проброса на хост                   |
+| `DB_HOST`                             | compose | внутри сети: `postgres`                                |
+| `XUI_DB_PATH`                         | compose | путь к базе 3x-ui внутри контейнера (`/panel/x-ui.db`) |
+| `XUI_DB_HOST_PATH`                    | `.env`  | каталог с базой 3x-ui на хосте                         |
+| `TZ`                                  | compose | таймзона (из `DEFAULT_TZ`)                             |
+
+Интервал опроса 3x-ui задаётся в коде (`loadConfig`, `PollInterval`).
+
+## Логи
+
+Пишутся через `lumberjack` в файл внутри контейнера (volume `app-logs`):
+
+```bash
+docker run --rm -v traffic-bot-app-logs:/logs alpine:3.20 tail -n 100 -f /logs/traffic-bot.log
+```
+
+или
+
+```bash
+make docker-app-logs
+```
+
+Ротация: 100 МБ на файл, 3 бэкапа, 28 дней, со сжатием.
+
+## Бэкапы
+
+```bash
+# Дамп
+docker exec -t traffic_bot-postgres pg_dump -U trafficbot trafficbot > backup_$(date +%F).sql
+
+# Восстановление
+cat backup_*.sql | docker exec -i traffic_bot-postgres psql -U trafficbot trafficbot
+```
+
+## Makefile
+
+```make
+docker-up:
+	docker compose --env-file .env -f docker-compose.yml up -d
+
+docker-check:
+	docker exec -it ${DB_NAME}-postgres psql -U ${DB_USER} -d ${DB_NAME} -c "\dt"
+
+docker-down:
+	docker compose --env-file .env -f docker-compose.yml down -v
+
+docker-logs:
+	docker compose --env-file .env -f docker-compose.yml logs -f
+
+docker-app-logs:
+	docker run --rm -v traffic-bot-app-logs:/logs   alpine:3.20   tail -n 50 /logs/traffic-bot.log
+
+docker-status:
+	docker compose ps
+
+docker-rebuild:
+	docker compose --env-file .env -f docker-compose.yml build --no-cache
+	docker compose --env-file .env -f docker-compose.yml up -d
+```
