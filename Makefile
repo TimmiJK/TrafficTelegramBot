@@ -2,23 +2,23 @@ include .env
 export
 
 docker-up:
-	docker compose --env-file .env -f docker-compose.yml up -d
+	sudo docker compose --env-file .env -f docker-compose.yml up -d
 
 docker-check:
-	docker exec -it ${DB_NAME}-postgres psql -U ${DB_USER} -d ${DB_NAME} -c "\dt"
+	sudo docker exec -it ${DB_NAME}-postgres psql -U ${DB_USER} -d ${DB_NAME} -c "\dt"
 
 docker-down:
-	docker compose --env-file .env -f docker-compose.yml down -v
+	sudo docker compose --env-file .env -f docker-compose.yml down -v
 
 docker-logs:
-	docker compose --env-file .env -f docker-compose.yml logs -f
+	sudo docker compose --env-file .env -f docker-compose.yml logs -f
 
 docker-app-logs:
-	docker run --rm -v traffic-bot-app-logs:/logs   alpine:3.20   tail -n 50 /logs/traffic-bot.log
+	sudo docker run --rm -v traffic-bot-app-logs:/logs   alpine:3.20   tail -n 50 /logs/traffic-bot.log
 
 docker-status:
-	docker compose ps
+	sudo docker compose ps
 
 docker-rebuild:
-	docker compose --env-file .env -f docker-compose.yml build --no-cache
-	docker compose --env-file .env -f docker-compose.yml up -d
+	sudo docker compose --env-file .env -f docker-compose.yml build --no-cache
+	sudo docker compose --env-file .env -f docker-compose.yml up -d

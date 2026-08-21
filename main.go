@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -342,6 +343,63 @@ func formatReport(ctx context.Context, db *sql.DB, userKey string) (string, erro
 	return strings.TrimSpace(sb.String()), nil
 }
 
+func getBoundUser(ctx context.Context, db *sql.DB, chatID int64) (string, error) {
+	var userKey string
+	err := db.QueryRowContext(ctx,
+		"SELECT user_key FROM bindings WHERE tg_chat_id = $1 LIMIT 1",
+		chatID,
+	).Scan(&userKey)
+	return userKey, err
+}
+
+func sendPeriodReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, chatID int64, period string, offset int, logger *slog.Logger) {
+	userKey, err := getBoundUser(ctx, pgDB, chatID)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
+		bot.Send(msg)
+		return
+	}
+
+	startTS, endTS := periodBounds(period, offset)
+	up, down, err := getUsageForPeriod(ctx, pgDB, userKey, startTS, endTS)
+	if err != nil {
+		logger.Error("Failed to get usage", "user", userKey, "period", period, "error", err)
+		return
+	}
+
+	name := map[string]string{
+		"day":   "Сегодня",
+		"week":  "Эта неделя",
+		"month": "Этот месяц",
+	}[period]
+
+	if offset == 1 {
+		name = map[string]string{
+			"day":   "Вчера",
+			"week":  "Прошлая неделя",
+			"month": "Прошлый месяц",
+		}[period]
+	}
+
+	text := fmt.Sprintf("👤 Пользователь: %s\nПериод: %s\n\n↑ %s\n↓ %s\nΣ %s",
+		userKey, name, ConvertBytes(up), ConvertBytes(down), ConvertBytes(up+down))
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	bot.Send(msg)
+}
+
+func isAdmin(chatID int64) (bool, error) {
+	adminID := os.Getenv("ADMIN_CHAT_ID")
+	adminIDInt64, err := strconv.ParseInt(adminID, 10, 64)
+	if err != nil {
+		return false, err
+	}
+	if adminIDInt64 == chatID {
+		return true, nil
+	}
+	return false, nil
+}
+
 func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, logger *slog.Logger) {
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
@@ -355,12 +413,16 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 
 		switch update.Message.Command() {
 		case "start":
-			msg := tgbotapi.NewMessage(chatID, "Привет! Команды:\n/usage - статистика\n/today - за день\n/week - за неделю\n/month - за месяц")
+			msg := tgbotapi.NewMessage(chatID,
+				"Привет! Команды:\n"+
+					"/bind <email> - привязать пользователя 3x-ui (Admin only)\n"+
+					"/usage - статистика за день, неделю и месяц\n"+
+					"/today /week /month - текущие периоды\n"+
+					"/yesterday /prevweek /prevmonth - прошлые периоды")
 			bot.Send(msg)
 
 		case "usage":
-			var userKey string
-			err := pgDB.QueryRowContext(ctx, "SELECT user_key FROM bindings WHERE tg_chat_id = $1 LIMIT 1", chatID).Scan(&userKey)
+			userKey, err := getBoundUser(ctx, pgDB, chatID)
 			if err != nil {
 				msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
 				bot.Send(msg)
@@ -377,6 +439,17 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 			bot.Send(msg)
 
 		case "bind":
+			isAdmin, err := isAdmin(chatID)
+			if err != nil {
+				logger.Error("Failed to check admin status", "error", err)
+				continue
+			}
+			if !isAdmin {
+				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
+				bot.Send(msg)
+				continue
+			}
+
 			args := update.Message.CommandArguments()
 			if args == "" {
 				msg := tgbotapi.NewMessage(chatID, "Использование: /bind email@example.com")
@@ -385,7 +458,7 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 			}
 
 			email := strings.ToLower(strings.TrimSpace(args))
-			_, err := pgDB.ExecContext(ctx, `
+			_, err = pgDB.ExecContext(ctx, `
 					INSERT INTO bindings (tg_chat_id, user_key, tz)
 					VALUES ($1, $2, $3)
 					ON CONFLICT (tg_chat_id, user_key) DO UPDATE SET tz = $3
@@ -399,6 +472,24 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 
 			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Привязан пользователь: %s", email))
 			bot.Send(msg)
+
+		case "today":
+			sendPeriodReport(ctx, bot, pgDB, chatID, "day", 0, logger)
+
+		case "week":
+			sendPeriodReport(ctx, bot, pgDB, chatID, "week", 0, logger)
+
+		case "month":
+			sendPeriodReport(ctx, bot, pgDB, chatID, "month", 0, logger)
+
+		case "yesterday":
+			sendPeriodReport(ctx, bot, pgDB, chatID, "day", 1, logger)
+
+		case "prevweek":
+			sendPeriodReport(ctx, bot, pgDB, chatID, "week", 1, logger)
+
+		case "prevmonth":
+			sendPeriodReport(ctx, bot, pgDB, chatID, "month", 1, logger)
 		}
 	}
 }
