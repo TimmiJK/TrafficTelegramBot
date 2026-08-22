@@ -1,0 +1,2 @@
+ALTER TABLE bindings DROP CONSTRAINT IF EXISTS fk_bindings_client;
+DROP TABLE IF EXISTS clients;

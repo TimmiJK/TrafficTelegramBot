@@ -1,0 +1,5 @@
+DROP INDEX IF EXISTS idx_usage_ts;
+DROP INDEX IF EXISTS idx_usage_user_ts;
+DROP TABLE IF EXISTS bindings;
+DROP TABLE IF EXISTS usage;
+DROP TABLE IF EXISTS state;
