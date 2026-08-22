@@ -1,0 +1,68 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            set -e
+            cd ~/TrafficTelegramBot
+
+            git pull origin main
+
+            set -a; . ./.env; set +a
+
+            docker compose up -d postgres
+            for i in $(seq 1 30); do
+              docker exec traffic_bot-postgres pg_isready -U "$DB_USER" -d "$DB_NAME" && break
+              sleep 2
+            done
+
+            docker run --rm --network host \
+              -v "$PWD/migrations:/migrations:ro" \
+              migrate/migrate:latest \
+              -path=/migrations \
+              -database "postgres://${DB_USER}:${ENC_PASS}@127.0.0.1:${DB_PORT}/${DB_NAME}?sslmode=disable" \
+              up
+
+            docker compose up -d --build
+            docker compose ps
+      - name: Telegram: deploy succeeded
+        if: success()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=✅ Deploy succeeded
+Репозиторий: ${{ github.repository }}
+Коммит: ${SHORT_SHA} — ${{ github.event.head_commit.message }}
+Автор: ${{ github.actor }}
+Логи: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Telegram: deploy failed
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=❌ Deploy FAILED
+Репозиторий: ${{ github.repository }}
+Коммит: ${SHORT_SHA} — ${{ github.event.head_commit.message }}
+Автор: ${{ github.actor }}
+Смотри: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"

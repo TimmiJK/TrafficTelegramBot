@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,8 +12,6 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/joho/godotenv"
 	"github.com/lib/pq"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -75,31 +72,6 @@ func openXUIDB(path string) (*sql.DB, error) {
 	}
 
 	return db, nil
-}
-
-//go:embed migrations/*.sql
-var migrationsFS embed.FS
-
-func runMigrations(cfg Config) error {
-	src, err := iofs.New(migrationsFS, "migrations")
-	if err != nil {
-		return fmt.Errorf("failed to load embedded migrations: %w", err)
-	}
-
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName)
-
-	m, err := migrate.NewWithSourceInstance("iofs", src, dsn)
-	if err != nil {
-		return fmt.Errorf("failed to init migrate: %w", err)
-	}
-	defer m.Close()
-
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("migrations failed: %w", err)
-	}
-
-	return nil
 }
 
 type Traffic struct {
@@ -638,12 +610,6 @@ func main() {
 	}
 	cancel()
 	logger.Info("Connected to PostgreSQL")
-
-	if err := runMigrations(cfg); err != nil {
-		logger.Error("Failed to run migrations", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("Migrations applied")
 
 	xuiDB, err := openXUIDB(cfg.XUIPath)
 	if err != nil {
