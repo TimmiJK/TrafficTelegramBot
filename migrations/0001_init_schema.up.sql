@@ -20,8 +20,6 @@ CREATE TABLE IF NOT EXISTS bindings (
     PRIMARY KEY (tg_chat_id, user_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_usage_user_ts
-    ON usage (user_key, ts);
+CREATE INDEX IF NOT EXISTS idx_usage_user_ts ON usage (user_key, ts);
 
-CREATE INDEX IF NOT EXISTS idx_usage_ts
-    ON usage (ts);
+CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage (ts);

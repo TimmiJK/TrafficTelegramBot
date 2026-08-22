@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"embed"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,8 +13,10 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"gopkg.in/natefinch/lumberjack.v2"
 	_ "modernc.org/sqlite"
 )
@@ -71,6 +75,30 @@ func openXUIDB(path string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+var migrationsFS embed.FS
+
+func runMigrations(cfg Config) error {
+	src, err := iofs.New(migrationsFS, "migrations")
+	if err != nil {
+		return fmt.Errorf("failed to load embedded migrations: %w", err)
+	}
+
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName)
+
+	m, err := migrate.NewWithSourceInstance("iofs", src, dsn)
+	if err != nil {
+		return fmt.Errorf("failed to init migrate: %w", err)
+	}
+	defer m.Close()
+
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("migrations failed: %w", err)
+	}
+
+	return nil
 }
 
 type Traffic struct {
@@ -180,6 +208,22 @@ func insertUsage(ctx context.Context, db *sql.DB, userKey string, up, down int64
 	return nil
 }
 
+func syncClients(ctx context.Context, db *sql.DB, traffic map[string]Traffic) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx,
+		"INSERT INTO clients (user_key) VALUES ($1) ON CONFLICT (user_key) DO NOTHING")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	return nil
+}
+
 func pollTraffic(ctx context.Context, xuiDB, pgDB *sql.DB, logger *slog.Logger) {
 	currentTraffic, err := fetchAllTraffic(ctx, xuiDB)
 	if err != nil {
@@ -190,6 +234,10 @@ func pollTraffic(ctx context.Context, xuiDB, pgDB *sql.DB, logger *slog.Logger) 
 	if len(currentTraffic) == 0 {
 		logger.Warn("No traffic data from 3x-ui")
 		return
+	}
+
+	if err := syncClients(ctx, pgDB, currentTraffic); err != nil {
+		logger.Error("Failed to sync clients", "error", err)
 	}
 
 	for userKey, current := range currentTraffic {
@@ -452,25 +500,84 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 
 			args := update.Message.CommandArguments()
 			if args == "" {
-				msg := tgbotapi.NewMessage(chatID, "Использование: /bind email@example.com")
+				msg := tgbotapi.NewMessage(chatID, "Использование: /bind chatID email@example.com")
 				bot.Send(msg)
 				continue
 			}
 
-			email := strings.ToLower(strings.TrimSpace(args))
-			_, err = pgDB.ExecContext(ctx, `
-					INSERT INTO bindings (tg_chat_id, user_key, tz)
-					VALUES ($1, $2, $3)
-					ON CONFLICT (tg_chat_id, user_key) DO UPDATE SET tz = $3
-				`, chatID, email, "UTC")
+			userData := strings.Split(strings.Trim(args, " "), " ")
+			if len(userData) < 2 {
+				msg := tgbotapi.NewMessage(chatID, "Нужно передать два аргумента chatID и email")
+				bot.Send(msg)
+				continue
+			}
+			bindChatID := userData[0]
+			email := userData[1]
+
+			_, err = pgDB.ExecContext(
+				ctx,
+				`
+				INSERT INTO bindings (tg_chat_id, user_key, tz) 
+				VALUES ($1, $2, $3) 
+				ON CONFLICT (tg_chat_id, user_key) DO UPDATE SET tz = $3
+				`,
+				bindChatID,
+				email,
+				"UTC",
+			)
 
 			if err != nil {
+				var pqErr *pq.Error
+				if errors.As(err, &pqErr) && strings.Contains(pqErr.Message, "violates foreign key constraint") {
+					msg := tgbotapi.NewMessage(chatID, "❌ Пользователь не найден в системе 3x-ui")
+					bot.Send(msg)
+					continue
+				}
 				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка привязки: %v", err))
 				bot.Send(msg)
 				continue
 			}
 
 			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Привязан пользователь: %s", email))
+			bot.Send(msg)
+
+		case "unbind":
+			isAdmin, err := isAdmin(chatID)
+			if err != nil {
+				logger.Error("Failed to check admin status", "error", err)
+				continue
+			}
+			if !isAdmin {
+				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
+				bot.Send(msg)
+				continue
+			}
+
+			args := update.Message.CommandArguments()
+			if args == "" {
+				msg := tgbotapi.NewMessage(chatID, "Использование: /unbind chatID email@example.com")
+				bot.Send(msg)
+				continue
+			}
+
+			userData := strings.Split(strings.Trim(args, " "), " ")
+			if len(userData) < 2 {
+				msg := tgbotapi.NewMessage(chatID, "Нужно передать два аргумента chatID и email")
+				bot.Send(msg)
+				continue
+			}
+			bindChatID := userData[0]
+			email := userData[1]
+
+			_, err = pgDB.ExecContext(ctx, `DELETE FROM bindings WHERE tg_chat_id = $1 AND user_key = $2`, bindChatID, email)
+
+			if err != nil {
+				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка отвязки: %v", err))
+				bot.Send(msg)
+				continue
+			}
+
+			msg := tgbotapi.NewMessage(chatID, "✅ Пользователь отвязан")
 			bot.Send(msg)
 
 		case "today":
@@ -530,6 +637,12 @@ func main() {
 	}
 	cancel()
 	logger.Info("Connected to PostgreSQL")
+
+	if err := runMigrations(cfg); err != nil {
+		logger.Error("Failed to run migrations", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Migrations applied")
 
 	xuiDB, err := openXUIDB(cfg.XUIPath)
 	if err != nil {
