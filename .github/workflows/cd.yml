@@ -37,32 +37,23 @@ jobs:
 
             docker compose up -d --build
             docker compose ps
-      - name: Telegram: deploy succeeded
-        if: success()
+      - name: Telegram notify
+        if: always()
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ job.status }}
         run: |
+          if [ "$STATUS" = "success" ]; then
+            ICON="✅"
+          else
+            ICON="❌"
+          fi
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="${ICON} Deploy ${STATUS}"
+          TEXT="${TEXT}"$'\n'"Commit: ${SHORT_SHA} by ${{ github.actor }}"
+          TEXT="${TEXT}"$'\n'"Run: ${RUN_URL}"
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT}" \
-            --data-urlencode "text=✅ Deploy succeeded
-Репозиторий: ${{ github.repository }}
-Коммит: ${SHORT_SHA} — ${{ github.event.head_commit.message }}
-Автор: ${{ github.actor }}
-Логи: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-      - name: Telegram: deploy failed
-        if: failure()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TG_CHAT}" \
-            --data-urlencode "text=❌ Deploy FAILED
-Репозиторий: ${{ github.repository }}
-Коммит: ${SHORT_SHA} — ${{ github.event.head_commit.message }}
-Автор: ${{ github.actor }}
-Смотри: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --data-urlencode "text=${TEXT}"
