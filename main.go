@@ -181,20 +181,13 @@ func insertUsage(ctx context.Context, db *sql.DB, userKey string, up, down int64
 	return nil
 }
 
-func syncClients(ctx context.Context, db *sql.DB, traffic map[string]Traffic) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.PrepareContext(ctx,
-		"INSERT INTO clients (user_key) VALUES ($1) ON CONFLICT (user_key) DO NOTHING")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	return nil
+func syncGroups(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO groups (group_key)
+		SELECT DISTINCT split_part(user_key, '_', 1)
+		FROM state
+		ON CONFLICT (group_key) DO NOTHING`)
+	return err
 }
 
 func pollTraffic(ctx context.Context, xuiDB, pgDB *sql.DB, logger *slog.Logger) {
@@ -207,10 +200,6 @@ func pollTraffic(ctx context.Context, xuiDB, pgDB *sql.DB, logger *slog.Logger) 
 	if len(currentTraffic) == 0 {
 		logger.Warn("No traffic data from 3x-ui")
 		return
-	}
-
-	if err := syncClients(ctx, pgDB, currentTraffic); err != nil {
-		logger.Error("Failed to sync clients", "error", err)
 	}
 
 	for userKey, current := range currentTraffic {
@@ -249,6 +238,10 @@ func pollTraffic(ctx context.Context, xuiDB, pgDB *sql.DB, logger *slog.Logger) 
 			logger.Error("Failed to update state", "user", userKey, "error", err)
 		}
 	}
+
+	if err := syncGroups(ctx, pgDB); err != nil {
+		logger.Error("Failed to sync groups", "error", err)
+	}
 }
 
 func periodBounds(period string, offset int) (int64, int64) {
@@ -280,13 +273,13 @@ func periodBounds(period string, offset int) (int64, int64) {
 	case "month":
 		year, month, _ := now.Date()
 
-		currentMonth30 := time.Date(year, month, 30, 0, 0, 0, 0, loc)
+		currentMonth29 := time.Date(year, month, 29, 0, 0, 0, 0, loc)
 
-		if now.Day() < 30 {
-			currentMonth30 = currentMonth30.AddDate(0, -1, 0)
+		if now.Day() < 29 {
+			currentMonth29 = currentMonth29.AddDate(0, -1, 0)
 		}
 
-		start := currentMonth30.AddDate(0, -offset, 0)
+		start := currentMonth29.AddDate(0, -offset, 0)
 		end := start.AddDate(0, 1, 0)
 
 		if offset == 0 {
@@ -298,18 +291,18 @@ func periodBounds(period string, offset int) (int64, int64) {
 	return 0, 0
 }
 
-func getUsageForPeriod(ctx context.Context, db *sql.DB, userKey string, startTS, endTS int64) (int64, int64, error) {
+func getUsageForPeriod(ctx context.Context, db *sql.DB, groupKey string, startTS, endTS int64) (int64, int64, error) {
 	var up, down int64
 	err := db.QueryRowContext(
 		ctx,
 		`
 		SELECT COALESCE(SUM(up), 0), COALESCE(SUM(down), 0)
 		FROM usage
-		WHERE user_key = $1
+		WHERE split_part(user_key, '_', 1) = $1
 		  AND ts >= $2
 		  AND ts < $3
 		`,
-		userKey,
+		groupKey,
 		startTS,
 		endTS,
 	).Scan(
