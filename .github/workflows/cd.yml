@@ -32,7 +32,7 @@ jobs:
               -v "$PWD/migrations:/migrations:ro" \
               migrate/migrate:latest \
               -path=/migrations \
-              -database "postgres://${DB_USER}:${ENC_PASS}@127.0.0.1:${DB_PORT}/${DB_NAME}?sslmode=disable" \
+              -database "postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${DB_PORT}/${DB_NAME}?sslmode=disable" \
               up
 
             docker compose up -d --build
