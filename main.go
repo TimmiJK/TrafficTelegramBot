@@ -77,6 +77,7 @@ func openXUIDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+//go:embed migrations/*.sql
 var migrationsFS embed.FS
 
 func runMigrations(cfg Config) error {
