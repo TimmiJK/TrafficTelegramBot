@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+group: deploy-production
+cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -37,6 +41,7 @@ jobs:
 
             docker compose up -d --build
             docker compose ps
+            docker image prune -f
       - name: Telegram notify
         if: always()
         env:

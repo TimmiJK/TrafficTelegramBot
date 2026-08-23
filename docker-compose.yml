@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
     ports:
-      - ${DB_PORT}:${DB_PORT}
+      - "${DB_HOST}:${DB_PORT}:${DB_PORT}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -35,10 +35,8 @@ services:
       DB_PORT: 5432
       TZ: ${DEFAULT_TZ:-UTC}
       XUI_DB_PATH: /panel/x-ui.db
-      OWN_DB_PATH: /app/data/usage.db
 
     volumes:
-      - app-data:/app/data
       - app-logs:/app/logs
 
       - ${XUI_DB_HOST_PATH:-/etc/x-ui}:/panel:ro
@@ -46,6 +44,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
     networks:
       - traffic-bot-net
@@ -53,8 +57,6 @@ services:
 volumes:
   postgres_data:
     name: traffic-bot-pg-data
-  app-data:
-    name: traffic-bot-app-data
   app-logs:
     name: traffic-bot-app-logs
 

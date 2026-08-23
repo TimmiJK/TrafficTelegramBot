@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -27,6 +29,8 @@ type Config struct {
 	XUIPath      string
 	BotToken     string
 	PollInterval time.Duration
+	BillingDay   int
+	AdminIDs     string
 }
 
 func loadConfig() Config {
@@ -38,7 +42,9 @@ func loadConfig() Config {
 		DBName:       os.Getenv("DB_NAME"),
 		XUIPath:      os.Getenv("XUI_DB_PATH"),
 		BotToken:     os.Getenv("BOT_TOKEN"),
-		PollInterval: 60 * time.Minute,
+		PollInterval: envDurationSec("POLL_INTERVAL", 600),
+		BillingDay:   envInt("BILLING_DAY", 29),
+		AdminIDs:     os.Getenv("ADMIN_CHAT_ID"),
 	}
 }
 
@@ -72,6 +78,24 @@ func openXUIDB(path string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func envInt(key string, defaultVal int) int {
+	if valStr := os.Getenv(key); valStr != "" {
+		if val, err := strconv.Atoi(valStr); err == nil {
+			return val
+		}
+	}
+	return defaultVal
+}
+
+func envDurationSec(key string, defaultVal int) time.Duration {
+	if valStr := os.Getenv(key); valStr != "" {
+		if val, err := strconv.Atoi(valStr); err == nil {
+			return time.Duration(val) * time.Second
+		}
+	}
+	return time.Duration(defaultVal) * time.Second
 }
 
 type Traffic struct {
@@ -244,6 +268,19 @@ func pollTraffic(ctx context.Context, xuiDB, pgDB *sql.DB, logger *slog.Logger) 
 	}
 }
 
+var billingDay int
+
+func daysInMonth(y int, m time.Month) int {
+	return time.Date(y, m+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+func billingStart(y int, m time.Month, day int, loc *time.Location) time.Time {
+	if d := daysInMonth(y, m); day > d {
+		day = d
+	}
+	return time.Date(y, m, day, 0, 0, 0, 0, loc)
+}
+
 func periodBounds(period string, offset int) (int64, int64) {
 	now := time.Now()
 	loc := now.Location()
@@ -271,17 +308,30 @@ func periodBounds(period string, offset int) (int64, int64) {
 		return start.Unix(), end.Unix()
 
 	case "month":
-		year, month, _ := now.Date()
-
-		currentMonth29 := time.Date(year, month, 29, 0, 0, 0, 0, loc)
-
-		if now.Day() < 29 {
-			currentMonth29 = currentMonth29.AddDate(0, -1, 0)
+		y, m, _ := now.Date()
+		cur := billingStart(y, m, billingDay, loc)
+		if now.Before(cur) {
+			m--
+			if m == 0 {
+				m, y = 12, y-1
+			}
+			cur = billingStart(y, m, billingDay, loc)
 		}
-
-		start := currentMonth29.AddDate(0, -offset, 0)
-		end := start.AddDate(0, 1, 0)
-
+		sy, sm, _ := cur.Date()
+		start := cur
+		for i := 0; i < offset; i++ {
+			sm--
+			if sm == 0 {
+				sm, sy = 12, sy-1
+			}
+			start = billingStart(sy, sm, billingDay, loc)
+		}
+		ey, em, _ := start.Date()
+		em++
+		if em == 13 {
+			em, ey = 1, ey+1
+		}
+		end := billingStart(ey, em, billingDay, loc)
 		if offset == 0 {
 			end = now
 		}
@@ -357,54 +407,75 @@ func formatReport(ctx context.Context, db *sql.DB, userKey string) (string, erro
 	return strings.TrimSpace(sb.String()), nil
 }
 
-func getBoundUser(ctx context.Context, db *sql.DB, chatID int64) (string, error) {
-	var userKey string
-	err := db.QueryRowContext(ctx,
-		"SELECT user_key FROM bindings WHERE tg_chat_id = $1 LIMIT 1",
-		chatID,
-	).Scan(&userKey)
-	return userKey, err
+func getBoundUsers(ctx context.Context, db *sql.DB, chatID int64) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SELECT user_key FROM bindings WHERE tg_chat_id = $1 ORDER BY user_key", chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
 }
 
 func sendPeriodReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, chatID int64, period string, offset int, logger *slog.Logger) {
-	userKey, err := getBoundUser(ctx, pgDB, chatID)
+	keys, err := getBoundUsers(ctx, pgDB, chatID)
 	if err != nil {
-		msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
+		if err == sql.ErrNoRows {
+			msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
+			bot.Send(msg)
+			return
+		}
+		logger.Error("Failed to get bound user", "chatID", chatID, "error", err)
+		msg := tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже.")
 		bot.Send(msg)
 		return
 	}
 
-	startTS, endTS := periodBounds(period, offset)
-	up, down, err := getUsageForPeriod(ctx, pgDB, userKey, startTS, endTS)
-	if err != nil {
-		logger.Error("Failed to get usage", "user", userKey, "period", period, "error", err)
+	if len(keys) == 0 {
+		bot.Send(tgbotapi.NewMessage(chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")"))
 		return
 	}
 
-	name := map[string]string{
-		"day":   "Сегодня",
-		"week":  "Эта неделя",
-		"month": "Этот месяц",
-	}[period]
+	for _, userKey := range keys {
+		startTS, endTS := periodBounds(period, offset)
+		up, down, err := getUsageForPeriod(ctx, pgDB, userKey, startTS, endTS)
+		if err != nil {
+			logger.Error("Failed to get usage", "user", userKey, "period", period, "error", err)
+			continue
+		}
 
-	if offset == 1 {
-		name = map[string]string{
-			"day":   "Вчера",
-			"week":  "Прошлая неделя",
-			"month": "Прошлый месяц",
+		name := map[string]string{
+			"day":   "Сегодня",
+			"week":  "Эта неделя",
+			"month": "Этот месяц",
 		}[period]
+
+		if offset == 1 {
+			name = map[string]string{
+				"day":   "Вчера",
+				"week":  "Прошлая неделя",
+				"month": "Прошлый месяц",
+			}[period]
+		}
+
+		text := fmt.Sprintf("👤 Пользователь: %s\nПериод: %s\n\n↑ %s\n↓ %s\nΣ %s",
+			userKey, name, ConvertBytes(up), ConvertBytes(down), ConvertBytes(up+down))
+
+		msg := tgbotapi.NewMessage(chatID, text)
+		bot.Send(msg)
 	}
-
-	text := fmt.Sprintf("👤 Пользователь: %s\nПериод: %s\n\n↑ %s\n↓ %s\nΣ %s",
-		userKey, name, ConvertBytes(up), ConvertBytes(down), ConvertBytes(up+down))
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	bot.Send(msg)
 }
 
-func isAdmin(chatID int64) (bool, error) {
-	adminID := os.Getenv("ADMIN_CHAT_ID")
-	adminIDInt64, err := strconv.ParseInt(adminID, 10, 64)
+func isAdmin(cfg Config, chatID int64) (bool, error) {
+	adminIDInt64, err := strconv.ParseInt(cfg.AdminIDs, 10, 64)
 	if err != nil {
 		return false, err
 	}
@@ -414,7 +485,7 @@ func isAdmin(chatID int64) (bool, error) {
 	return false, nil
 }
 
-func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, logger *slog.Logger) {
+func handleBotCommands(ctx context.Context, cfg Config, bot *tgbotapi.BotAPI, pgDB *sql.DB, logger *slog.Logger) {
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
 
@@ -429,31 +500,46 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 		case "start":
 			msg := tgbotapi.NewMessage(chatID,
 				"Привет! Команды:\n"+
-					"/bind <email> - привязать пользователя 3x-ui (Admin only)\n"+
+					"/bind chatID <email> - привязать пользователя 3x-ui (Admin only)\n"+
+					"/unbind chatID <email> - отвязать пользователя 3x-ui (Admin only)\n"+
 					"/usage - статистика за день, неделю и месяц\n"+
+					"/myID - узнать свой chatID\n"+
 					"/today /week /month - текущие периоды\n"+
 					"/yesterday /prevweek /prevmonth - прошлые периоды")
 			bot.Send(msg)
 
-		case "usage":
-			userKey, err := getBoundUser(ctx, pgDB, chatID)
-			if err != nil {
-				msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
-				bot.Send(msg)
-				continue
-			}
-
-			report, err := formatReport(ctx, pgDB, userKey)
-			if err != nil {
-				logger.Error("Failed to format report", "error", err)
-				continue
-			}
-
-			msg := tgbotapi.NewMessage(chatID, report)
+		case "myID":
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ваш chatID: %d", chatID))
 			bot.Send(msg)
+		case "usage":
+			keys, err := getBoundUsers(ctx, pgDB, chatID)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
+					bot.Send(msg)
+					continue
+				}
+				logger.Error("Failed to get bound user", "chatID", chatID, "error", err)
+				msg := tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже.")
+				bot.Send(msg)
+			}
+
+			if len(keys) == 0 {
+				bot.Send(tgbotapi.NewMessage(chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")"))
+				continue
+			}
+
+			for _, userKey := range keys {
+				report, err := formatReport(ctx, pgDB, userKey)
+				if err != nil {
+					logger.Error("Failed to format report", "user", userKey, "error", err)
+					continue
+				}
+				bot.Send(tgbotapi.NewMessage(chatID, report))
+			}
 
 		case "bind":
-			isAdmin, err := isAdmin(chatID)
+			isAdmin, err := isAdmin(cfg, chatID)
 			if err != nil {
 				logger.Error("Failed to check admin status", "error", err)
 				continue
@@ -471,25 +557,23 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 				continue
 			}
 
-			userData := strings.Split(strings.Trim(args, " "), " ")
-			if len(userData) < 2 {
-				msg := tgbotapi.NewMessage(chatID, "Нужно передать два аргумента chatID и email")
-				bot.Send(msg)
+			userData := strings.Fields(args)
+			targetChat, err := strconv.ParseInt(userData[0], 10, 64)
+			if err != nil {
+				bot.Send(tgbotapi.NewMessage(chatID, "❌ Первый аргумент должен быть числом (chat ID)"))
 				continue
 			}
-			bindChatID := userData[0]
-			email := userData[1]
+			email := strings.ToLower(strings.TrimSpace(userData[1]))
 
 			_, err = pgDB.ExecContext(
 				ctx,
 				`
-				INSERT INTO bindings (tg_chat_id, user_key, tz) 
-				VALUES ($1, $2, $3) 
-				ON CONFLICT (tg_chat_id, user_key) DO UPDATE SET tz = $3
+				INSERT INTO bindings (tg_chat_id, user_key)
+				VALUES ($1, $2)
+				ON CONFLICT (tg_chat_id, user_key) DO NOTHING
 				`,
-				bindChatID,
+				targetChat,
 				email,
-				"UTC",
 			)
 
 			if err != nil {
@@ -508,7 +592,7 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 			bot.Send(msg)
 
 		case "unbind":
-			isAdmin, err := isAdmin(chatID)
+			isAdmin, err := isAdmin(cfg, chatID)
 			if err != nil {
 				logger.Error("Failed to check admin status", "error", err)
 				continue
@@ -526,16 +610,15 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 				continue
 			}
 
-			userData := strings.Split(strings.Trim(args, " "), " ")
-			if len(userData) < 2 {
-				msg := tgbotapi.NewMessage(chatID, "Нужно передать два аргумента chatID и email")
-				bot.Send(msg)
+			userData := strings.Fields(args)
+			targetChat, err := strconv.ParseInt(userData[0], 10, 64)
+			if err != nil {
+				bot.Send(tgbotapi.NewMessage(chatID, "❌ Первый аргумент должен быть числом (chat ID)"))
 				continue
 			}
-			bindChatID := userData[0]
-			email := userData[1]
+			email := strings.ToLower(strings.TrimSpace(userData[1]))
 
-			_, err = pgDB.ExecContext(ctx, `DELETE FROM bindings WHERE tg_chat_id = $1 AND user_key = $2`, bindChatID, email)
+			res, err := pgDB.ExecContext(ctx, `DELETE FROM bindings WHERE tg_chat_id = $1 AND user_key = $2`, targetChat, email)
 
 			if err != nil {
 				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка отвязки: %v", err))
@@ -543,7 +626,12 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 				continue
 			}
 
-			msg := tgbotapi.NewMessage(chatID, "✅ Пользователь отвязан")
+			var msg tgbotapi.MessageConfig
+			if n, _ := res.RowsAffected(); n == 0 {
+				msg = tgbotapi.NewMessage(chatID, "Привязка не найдена")
+			} else {
+				msg = tgbotapi.NewMessage(chatID, "✅ Пользователь отвязан")
+			}
 			bot.Send(msg)
 
 		case "today":
@@ -563,6 +651,10 @@ func handleBotCommands(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, 
 
 		case "prevmonth":
 			sendPeriodReport(ctx, bot, pgDB, chatID, "month", 1, logger)
+
+		default:
+			msg := tgbotapi.NewMessage(chatID, "Неизвестная команда. Используйте /start для списка команд.")
+			bot.Send(msg)
 		}
 	}
 }
@@ -577,7 +669,7 @@ func main() {
 	}
 	defer logWriter.Close()
 
-	logger := slog.New(slog.NewJSONHandler(logWriter, &slog.HandlerOptions{
+	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, logWriter), &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
@@ -588,6 +680,10 @@ func main() {
 	}
 
 	cfg := loadConfig()
+	billingDay = cfg.BillingDay
+	if len(cfg.AdminIDs) == 0 {
+		logger.Warn("ADMIN_CHAT_ID not set: /bind and /unbind are disabled")
+	}
 
 	pgDB, err := NewPostgresDB(cfg)
 	if err != nil {
@@ -639,5 +735,5 @@ func main() {
 	pollTraffic(ctx, xuiDB, pgDB, logger)
 	cancel()
 
-	handleBotCommands(context.Background(), bot, pgDB, logger)
+	handleBotCommands(context.Background(), cfg, bot, pgDB, logger)
 }
