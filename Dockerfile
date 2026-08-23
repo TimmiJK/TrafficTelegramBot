@@ -14,15 +14,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 FROM alpine:3.20
 
-RUN apk add --no-cache \
-        ca-certificates \
-        tzdata \
-        sqlite \
-        postgresql-client \
-    && addgroup -S app \
-    && adduser  -S app -G app \
-    && mkdir -p /app/logs /app/data \
-    && chown -R app:app /app
+RUN apk add --no-cache ca-certificates && \
+    addgroup -S app && adduser -S app -G app && \
+    mkdir -p /app/logs && chown -R app:app /app
 
 WORKDIR /app
 
@@ -30,6 +24,6 @@ COPY --from=builder /out/traffic-bot /app/traffic-bot
 
 USER app
 
-VOLUME ["/app/data", "/app/logs"]
+VOLUME ["/app/logs"]
 
 ENTRYPOINT ["/app/traffic-bot"]

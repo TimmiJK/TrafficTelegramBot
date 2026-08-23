@@ -5,7 +5,7 @@ docker-up:
 	sudo docker compose --env-file .env -f docker-compose.yml up -d
 
 docker-check:
-	sudo docker exec -it ${DB_NAME}-postgres psql -U ${DB_USER} -d ${DB_NAME} -c "\dt"
+	sudo docker exec -it ${DB_NAME}-postgres psql -U ${DB_USER} -d ${DB_NAME}
 
 docker-down:
 	sudo docker compose --env-file .env -f docker-compose.yml down -v
