@@ -30,7 +30,6 @@ type Config struct {
 	BotToken     string
 	PollInterval time.Duration
 	BillingDay   int
-	AdminIDs     string
 }
 
 func loadConfig() Config {
@@ -44,7 +43,6 @@ func loadConfig() Config {
 		BotToken:     os.Getenv("BOT_TOKEN"),
 		PollInterval: envDurationSec("POLL_INTERVAL", 600),
 		BillingDay:   envInt("BILLING_DAY", 29),
-		AdminIDs:     os.Getenv("ADMIN_CHAT_ID"),
 	}
 }
 
@@ -474,18 +472,166 @@ func sendPeriodReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, c
 	}
 }
 
-func isAdmin(cfg Config, chatID int64) (bool, error) {
-	adminIDInt64, err := strconv.ParseInt(cfg.AdminIDs, 10, 64)
+var periodMap = map[string]struct {
+	code   string
+	offset int
+	name   string
+}{
+	"today":     {"day", 0, "Сегодня"},
+	"week":      {"week", 0, "Эта неделя"},
+	"month":     {"month", 0, "Этот месяц"},
+	"yesterday": {"day", 1, "Вчера"},
+	"prevweek":  {"week", 1, "Прошлая неделя"},
+	"prevmonth": {"month", 1, "Прошлый месяц"},
+}
+
+type groupUsage struct {
+	Group string
+	Up    int64
+	Down  int64
+}
+
+func getAllGroupsUsage(ctx context.Context, db *sql.DB, startTS, endTS int64) ([]groupUsage, error) {
+	rows, err := db.QueryContext(
+		ctx,
+		`
+		SELECT g.group_key,
+		       COALESCE(SUM(u.up), 0),
+		       COALESCE(SUM(u.down), 0)
+		FROM groups g
+		LEFT JOIN usage u
+		       ON split_part(u.user_key, '_', 1) = g.group_key
+		      AND u.ts >= $1 AND u.ts < $2
+		GROUP BY g.group_key
+		ORDER BY (COALESCE(SUM(u.up), 0) + COALESCE(SUM(u.down), 0)) DESC, g.group_key
+		`,
+		startTS, endTS)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	if adminIDInt64 == chatID {
+	defer rows.Close()
+
+	var out []groupUsage
+	for rows.Next() {
+		var g groupUsage
+		if err := rows.Scan(&g.Group, &g.Up, &g.Down); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func sendAllGroupsReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, chatID int64, periodKey string, logger *slog.Logger) {
+	p, ok := periodMap[periodKey]
+	if !ok {
+		bot.Send(tgbotapi.NewMessage(chatID, "Неизвестный период. Доступно: today, week, month, yesterday, prevweek, prevmonth"))
+		return
+	}
+
+	startTS, endTS := periodBounds(p.code, p.offset)
+	rows, err := getAllGroupsUsage(ctx, pgDB, startTS, endTS)
+	if err != nil {
+		logger.Error("Failed to get all groups usage", "error", err)
+		bot.Send(tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже."))
+		return
+	}
+	if len(rows) == 0 {
+		bot.Send(tgbotapi.NewMessage(chatID, "Нет данных за период"))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📊 Трафик по пользователям\nПериод: %s\n\n", p.name))
+
+	var totalUp, totalDown int64
+	for _, r := range rows {
+		totalUp += r.Up
+		totalDown += r.Down
+		sb.WriteString(fmt.Sprintf("%s: ↑ %s ↓ %s Σ %s\n",
+			r.Group, ConvertBytes(r.Up), ConvertBytes(r.Down), ConvertBytes(r.Up+r.Down)))
+	}
+	sb.WriteString(fmt.Sprintf("\nИтого: ↑ %s ↓ %s Σ %s",
+		ConvertBytes(totalUp), ConvertBytes(totalDown), ConvertBytes(totalUp+totalDown)))
+
+	bot.Send(tgbotapi.NewMessage(chatID, sb.String()))
+}
+
+func isAdmin(adminID, chatID int64) (bool, error) {
+	if adminID == chatID {
 		return true, nil
 	}
 	return false, nil
 }
 
-func handleBotCommands(ctx context.Context, cfg Config, bot *tgbotapi.BotAPI, pgDB *sql.DB, logger *slog.Logger) {
+func getTotalUsage(ctx context.Context, db *sql.DB, startTS, endTS int64) (int64, int64, error) {
+	var up, down int64
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(up), 0), COALESCE(SUM(down), 0)
+		FROM usage
+		WHERE ts >= $1 AND ts < $2`,
+		startTS, endTS,
+	).Scan(&up, &down)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, 0, err
+	}
+	return up, down, nil
+}
+
+func limitTrafficAlert(ctx context.Context, bot *tgbotapi.BotAPI, adminID, limitBytes int64, pgDB *sql.DB, logger *slog.Logger) {
+	startTS, endTS := periodBounds("month", 0)
+
+	totalUp, totalDown, err := getTotalUsage(ctx, pgDB, startTS, endTS)
+	if err != nil {
+		logger.Error("Failed to get total usage", "error", err)
+		return
+	}
+
+	total := totalUp + totalDown
+	if total <= limitBytes {
+		return
+	}
+
+	var lastPeriod int64
+	err = pgDB.QueryRowContext(ctx,
+		`SELECT period_start FROM alert_state WHERE key = 'month_limit'`,
+	).Scan(&lastPeriod)
+	if err == nil && lastPeriod == startTS {
+		return
+	}
+	if err != nil && err != sql.ErrNoRows {
+		logger.Error("Failed to read alert_state", "error", err)
+		return
+	}
+
+	percent := float64(total) / float64(limitBytes) * 100
+	text := fmt.Sprintf(
+		"🚨 Превышен лимит общего трафика!\n\n"+
+			"Лимит: %s\n"+
+			"Использовано: ↑ %s ↓ %s Σ %s (%.0f%%)\n"+
+			"Период: текущий биллинг-месяц",
+		ConvertBytes(limitBytes),
+		ConvertBytes(totalUp), ConvertBytes(totalDown), ConvertBytes(total), percent,
+	)
+
+	if _, err := bot.Send(tgbotapi.NewMessage(adminID, text)); err != nil {
+		logger.Error("Failed to send limit alert", "error", err)
+		return
+	}
+
+	if _, err := pgDB.ExecContext(ctx, `
+		INSERT INTO alert_state (key, period_start, last_sent_ts)
+		VALUES ('month_limit', $1, $2)
+		ON CONFLICT (key) DO UPDATE SET period_start = $1, last_sent_ts = $2`,
+		startTS, time.Now().Unix(),
+	); err != nil {
+		logger.Error("Failed to save alert state", "error", err)
+	}
+
+	logger.Info("Limit alert sent", "total", total, "percent", percent)
+}
+
+func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI, pgDB *sql.DB, logger *slog.Logger) {
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
 
@@ -502,6 +648,7 @@ func handleBotCommands(ctx context.Context, cfg Config, bot *tgbotapi.BotAPI, pg
 				"Привет! Команды:\n"+
 					"/bind chatID <email> - привязать пользователя 3x-ui (Admin only)\n"+
 					"/unbind chatID <email> - отвязать пользователя 3x-ui (Admin only)\n"+
+					"/all [период] - сводка по всем пользователям (Admin only)\n"+
 					"/usage - статистика за день, неделю и месяц\n"+
 					"/myID - узнать свой chatID\n"+
 					"/today /week /month - текущие периоды\n"+
@@ -511,6 +658,25 @@ func handleBotCommands(ctx context.Context, cfg Config, bot *tgbotapi.BotAPI, pg
 		case "myID":
 			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ваш chatID: %d", chatID))
 			bot.Send(msg)
+
+		case "all":
+			isAdmin, err := isAdmin(adminID, chatID)
+			if err != nil {
+				logger.Error("Failed to check admin status", "error", err)
+				continue
+			}
+			if !isAdmin {
+				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
+				bot.Send(msg)
+				continue
+			}
+
+			arg := strings.ToLower(strings.TrimSpace(update.Message.CommandArguments()))
+			if arg == "" {
+				arg = "month"
+			}
+			sendAllGroupsReport(ctx, bot, pgDB, chatID, arg, logger)
+
 		case "usage":
 			keys, err := getBoundUsers(ctx, pgDB, chatID)
 			if err != nil {
@@ -539,7 +705,7 @@ func handleBotCommands(ctx context.Context, cfg Config, bot *tgbotapi.BotAPI, pg
 			}
 
 		case "bind":
-			isAdmin, err := isAdmin(cfg, chatID)
+			isAdmin, err := isAdmin(adminID, chatID)
 			if err != nil {
 				logger.Error("Failed to check admin status", "error", err)
 				continue
@@ -592,7 +758,7 @@ func handleBotCommands(ctx context.Context, cfg Config, bot *tgbotapi.BotAPI, pg
 			bot.Send(msg)
 
 		case "unbind":
-			isAdmin, err := isAdmin(cfg, chatID)
+			isAdmin, err := isAdmin(adminID, chatID)
 			if err != nil {
 				logger.Error("Failed to check admin status", "error", err)
 				continue
@@ -681,7 +847,11 @@ func main() {
 
 	cfg := loadConfig()
 	billingDay = cfg.BillingDay
-	if len(cfg.AdminIDs) == 0 {
+	adminID, err := strconv.ParseInt(os.Getenv("ADMIN_CHAT_ID"), 10, 64)
+	if err != nil {
+		logger.Warn("ADMIN_CHAT_ID invalid, limit alerts disabled")
+	}
+	if adminID == 0 {
 		logger.Warn("ADMIN_CHAT_ID not set: /bind and /unbind are disabled")
 	}
 
@@ -735,5 +905,23 @@ func main() {
 	pollTraffic(ctx, xuiDB, pgDB, logger)
 	cancel()
 
-	handleBotCommands(context.Background(), cfg, bot, pgDB, logger)
+	limitBytes := int64(envInt("TRAFFIC_LIMIT_GB", 2458)) << 30
+
+	if adminID != 0 {
+		go func() {
+			check := func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				limitTrafficAlert(ctx, bot, adminID, limitBytes, pgDB, logger)
+				cancel()
+			}
+			check()
+			ticker := time.NewTicker(30 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				check()
+			}
+		}()
+	}
+
+	handleBotCommands(context.Background(), adminID, bot, pgDB, logger)
 }
