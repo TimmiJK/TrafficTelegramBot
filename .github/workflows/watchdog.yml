@@ -1,0 +1,65 @@
+name: Watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: watchdog-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check server and containers
+        id: probe
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          command_timeout: 30s
+          script: |
+            set -e
+            uptime
+            docker ps --format '{{.Names}}' | grep -qx traffic-bot-app
+            docker ps --format '{{.Names}}' | grep -qx traffic_bot-postgres
+            status=$(docker inspect --format '{{.State.Status}}' traffic-bot-app 2>/dev/null || echo missing)
+            if [ "$status" = "restarting" ]; then
+              echo "app is in restart-loop" >&2
+              exit 1
+            fi
+            echo "STATUS=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Alert DOWN
+        if: steps.probe.outcome == 'failure'
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="🚨 Watchdog: сервер или сервис недоступны"
+          TEXT="${TEXT}"$'\n'"Хост: ${{ secrets.DEPLOY_HOST }}"
+          TEXT="${TEXT}"$'\n'"Время: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          TEXT="${TEXT}"$'\n'"Логи: ${RUN_URL}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=${TEXT}"
+
+      - name: Alert UP
+        if: steps.probe.outcome == 'success'
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            exit 0
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=✅ Watchdog: сервер доступен"
