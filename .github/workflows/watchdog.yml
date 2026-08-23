@@ -33,7 +33,6 @@ jobs:
               echo "app is in restart-loop" >&2
               exit 1
             fi
-            echo "STATUS=ok" >> "$GITHUB_OUTPUT"
 
       - name: Alert DOWN
         if: steps.probe.outcome == 'failure'
