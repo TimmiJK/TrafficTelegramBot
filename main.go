@@ -266,7 +266,42 @@ func pollTraffic(ctx context.Context, xuiDB, pgDB *sql.DB, logger *slog.Logger) 
 	}
 }
 
-var billingDay int
+var (
+	billingDay    int
+	billingStart0 time.Time
+	billingEnd0   time.Time
+)
+
+const billingPeriodDays = 30
+
+func billingStartAt(j int, loc *time.Location) time.Time {
+	if j == 0 && !billingStart0.IsZero() {
+		return billingStart0.In(loc)
+	}
+
+	return billingEnd0.In(loc).AddDate(0, 0, billingPeriodDays*(j-1)+1)
+}
+
+func currentBillingIndex(now time.Time, loc *time.Location) int {
+	nextStart := billingEnd0.In(loc).AddDate(0, 0, 1)
+	if now.Before(nextStart) {
+		return 0
+	}
+	days := int(now.Sub(nextStart).Hours() / 24)
+	return days/billingPeriodDays + 1
+}
+
+func billingBounds(now time.Time, offset int, loc *time.Location) (int64, int64) {
+	k := currentBillingIndex(now, loc)
+
+	start := billingStartAt(k-offset, loc)
+	end := billingStartAt(k-offset+1, loc)
+
+	if offset == 0 {
+		end = now
+	}
+	return start.Unix(), end.Unix()
+}
 
 func daysInMonth(y int, m time.Month) int {
 	return time.Date(y, m+1, 0, 0, 0, 0, 0, time.UTC).Day()
@@ -306,6 +341,10 @@ func periodBounds(period string, offset int) (int64, int64) {
 		return start.Unix(), end.Unix()
 
 	case "month":
+		if !billingEnd0.IsZero() {
+			return billingBounds(now, offset, loc)
+		}
+
 		y, m, _ := now.Date()
 		cur := billingStart(y, m, billingDay, loc)
 		if now.Before(cur) {
@@ -847,6 +886,29 @@ func main() {
 
 	cfg := loadConfig()
 	billingDay = cfg.BillingDay
+	if v := os.Getenv("BILLING_EXPIRY"); v != "" {
+		t, err := time.ParseInLocation("2006-01-02", v, time.Now().Location())
+		if err != nil {
+			logger.Warn("Invalid BILLING_EXPIRY, falling back to BILLING_DAY", "value", v)
+		} else {
+			billingEnd0 = t
+		}
+	}
+	if v := os.Getenv("BILLING_START"); v != "" {
+		t, err := time.ParseInLocation("2006-01-02", v, time.Now().Location())
+		if err != nil {
+			logger.Warn("Invalid BILLING_START", "value", v)
+		} else {
+			billingStart0 = t
+		}
+	}
+	if !billingEnd0.IsZero() {
+		logger.Info("Rolling billing mode enabled",
+			"start", billingStart0.Format("2006-01-02"),
+			"expiry", billingEnd0.Format("2006-01-02"),
+			"period_days", billingPeriodDays)
+	}
+
 	adminID, err := strconv.ParseInt(os.Getenv("ADMIN_CHAT_ID"), 10, 64)
 	if err != nil {
 		logger.Warn("ADMIN_CHAT_ID invalid, limit alerts disabled")
