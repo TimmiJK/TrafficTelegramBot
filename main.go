@@ -80,7 +80,7 @@ func openXUIDB(path string) (*sql.DB, error) {
 
 func envInt(key string, defaultVal int) int {
 	if valStr := os.Getenv(key); valStr != "" {
-		if val, err := strconv.Atoi(valStr); err == nil {
+		if val, err := strconv.Atoi(valStr); err == nil && val > 0 {
 			return val
 		}
 	}
@@ -89,7 +89,7 @@ func envInt(key string, defaultVal int) int {
 
 func envDurationSec(key string, defaultVal int) time.Duration {
 	if valStr := os.Getenv(key); valStr != "" {
-		if val, err := strconv.Atoi(valStr); err == nil {
+		if val, err := strconv.Atoi(valStr); err == nil && val > 0 {
 			return time.Duration(val) * time.Second
 		}
 	}
@@ -298,7 +298,7 @@ func billingBounds(now time.Time, offset int, loc *time.Location) (int64, int64)
 	end := billingStartAt(k-offset+1, loc)
 
 	if offset == 0 {
-		end = now
+		end = now.Add(time.Second)
 	}
 	return start.Unix(), end.Unix()
 }
@@ -324,7 +324,7 @@ func periodBounds(period string, offset int) (int64, int64) {
 		start := time.Date(year, month, day, 0, 0, 0, 0, loc).AddDate(0, 0, -offset)
 		end := start.AddDate(0, 0, 1)
 		if offset == 0 {
-			end = now
+			end = now.Add(time.Second)
 		}
 		return start.Unix(), end.Unix()
 
@@ -336,7 +336,7 @@ func periodBounds(period string, offset int) (int64, int64) {
 		start := currentWeekStart.AddDate(0, 0, -7*offset)
 		end := start.AddDate(0, 0, 7)
 		if offset == 0 {
-			end = now
+			end = now.Add(time.Second)
 		}
 		return start.Unix(), end.Unix()
 
@@ -370,7 +370,7 @@ func periodBounds(period string, offset int) (int64, int64) {
 		}
 		end := billingStart(ey, em, billingDay, loc)
 		if offset == 0 {
-			end = now
+			end = now.Add(time.Second)
 		}
 		return start.Unix(), end.Unix()
 	}
