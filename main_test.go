@@ -144,6 +144,10 @@ func TestBillingBoundsRolling(t *testing.T) {
 }
 
 func TestPeriodBoundsInvariants(t *testing.T) {
+	oldStart, oldEnd := billingStart0, billingEnd0
+	billingStart0, billingEnd0 = time.Time{}, time.Time{}
+	defer func() { billingStart0, billingEnd0 = oldStart, oldEnd }()
+
 	loc := time.Now().Location()
 	billingDay = 29
 
@@ -153,8 +157,8 @@ func TestPeriodBoundsInvariants(t *testing.T) {
 			if start >= end {
 				t.Fatalf("%s offset=%d: start >= end", period, offset)
 			}
-
 			dur := time.Duration(end-start) * time.Second
+
 			switch period {
 			case "day":
 				if offset == 1 && dur != 24*time.Hour {
@@ -171,20 +175,40 @@ func TestPeriodBoundsInvariants(t *testing.T) {
 					t.Errorf("week offset=0: dur = %v, want (0, 168h]", dur)
 				}
 			case "month":
-				if offset == 1 && dur != 30*24*time.Hour {
-					t.Errorf("month offset=1: dur = %v, want 720h", dur)
-				}
-				if offset == 0 && (dur <= 0 || dur > 30*24*time.Hour+time.Second) {
-					t.Errorf("month offset=%d: dur = %v, want (0, 720h]", offset, dur)
+				if offset == 0 {
+					if dur <= 0 || dur > 31*24*time.Hour+time.Second {
+						t.Errorf("month offset=0: dur = %v, want (0, 31d]", dur)
+					}
+				} else {
+					if dur < 28*24*time.Hour || dur > 31*24*time.Hour {
+						t.Errorf("month offset=1: dur = %v, want [28d, 31d]", dur)
+					}
 				}
 			}
 
+			// начало периода — всегда полночь
 			st := time.Unix(start, 0).In(loc)
 			if st.Hour() != 0 || st.Minute() != 0 || st.Second() != 0 {
 				t.Errorf("%s offset=%d: start not midnight: %v", period, offset, st)
 			}
 		}
 	}
+}
+
+func TestPeriodBoundsMonthRolling(t *testing.T) {
+	oldStart, oldEnd := billingStart0, billingEnd0
+	defer func() { billingStart0, billingEnd0 = oldStart, oldEnd }()
+
+	loc := time.Now().Location()
+	billingStart0 = time.Now().AddDate(0, 0, -40).Truncate(24 * time.Hour)
+	billingEnd0 = billingStart0.AddDate(0, 0, 29)
+
+	_, end1 := periodBounds("month", 1)
+	start1, _ := periodBounds("month", 1)
+	if dur := time.Duration(end1-start1) * time.Second; dur != 30*24*time.Hour {
+		t.Errorf("rolling month offset=1: dur = %v, want 720h", dur)
+	}
+	_ = loc
 }
 
 func TestBillingBoundsExactBoundaries(t *testing.T) {
