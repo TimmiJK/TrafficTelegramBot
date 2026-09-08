@@ -124,7 +124,9 @@ func fetchAllTraffic(ctx context.Context, xuiDB *sql.DB) (map[string]Traffic, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	result := make(map[string]Traffic)
 	for rows.Next() {
@@ -467,7 +469,9 @@ func getBoundUsers(ctx context.Context, db *sql.DB, chatID int64) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	var keys []string
 	for rows.Next() {
@@ -480,22 +484,26 @@ func getBoundUsers(ctx context.Context, db *sql.DB, chatID int64) ([]string, err
 	return keys, rows.Err()
 }
 
+func sendText(bot *tgbotapi.BotAPI, chatID int64, text string, logger *slog.Logger) {
+	if _, err := bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
+		logger.Error("Failed to send Telegram message", "chat_id", chatID, "error", err)
+	}
+}
+
 func sendPeriodReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, chatID int64, period string, offset int, logger *slog.Logger) {
 	keys, err := getBoundUsers(ctx, pgDB, chatID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
-			bot.Send(msg)
+			sendText(bot, chatID, "Сначала привяжите пользователя: /bind UserID email@example.com", logger)
 			return
 		}
 		logger.Error("Failed to get bound user", "chatID", chatID, "error", err)
-		msg := tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже.")
-		bot.Send(msg)
+		sendText(bot, chatID, "Произошла ошибка, попробуйте позже.", logger)
 		return
 	}
 
 	if len(keys) == 0 {
-		bot.Send(tgbotapi.NewMessage(chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")"))
+		sendText(bot, chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")", logger)
 		return
 	}
 
@@ -524,8 +532,7 @@ func sendPeriodReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, c
 		text := fmt.Sprintf("👤 Пользователь: %s\nПериод: %s\n\n↑ %s\n↓ %s\nΣ %s",
 			userKey, name, ConvertBytes(up), ConvertBytes(down), ConvertBytes(up+down))
 
-		msg := tgbotapi.NewMessage(chatID, text)
-		bot.Send(msg)
+		sendText(bot, chatID, text, logger)
 	}
 }
 
@@ -566,7 +573,9 @@ func getAllGroupsUsage(ctx context.Context, db *sql.DB, startTS, endTS int64) ([
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	var out []groupUsage
 	for rows.Next() {
@@ -582,7 +591,7 @@ func getAllGroupsUsage(ctx context.Context, db *sql.DB, startTS, endTS int64) ([
 func sendAllGroupsReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, chatID int64, periodKey string, logger *slog.Logger) {
 	p, ok := periodMap[periodKey]
 	if !ok {
-		bot.Send(tgbotapi.NewMessage(chatID, "Неизвестный период. Доступно: today, week, month, yesterday, prevweek, prevmonth"))
+		sendText(bot, chatID, "Неизвестный период. Доступно: today, week, month, yesterday, prevweek, prevmonth", logger)
 		return
 	}
 
@@ -590,11 +599,11 @@ func sendAllGroupsReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB
 	rows, err := getAllGroupsUsage(ctx, pgDB, startTS, endTS)
 	if err != nil {
 		logger.Error("Failed to get all groups usage", "error", err)
-		bot.Send(tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже."))
+		sendText(bot, chatID, "Произошла ошибка, попробуйте позже.", logger)
 		return
 	}
 	if len(rows) == 0 {
-		bot.Send(tgbotapi.NewMessage(chatID, "Нет данных за период"))
+		sendText(bot, chatID, "Нет данных за период", logger)
 		return
 	}
 
@@ -611,7 +620,7 @@ func sendAllGroupsReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB
 	sb.WriteString(fmt.Sprintf("\nИтого: ↑ %s ↓ %s Σ %s",
 		ConvertBytes(totalUp), ConvertBytes(totalDown), ConvertBytes(totalUp+totalDown)))
 
-	bot.Send(tgbotapi.NewMessage(chatID, sb.String()))
+	sendText(bot, chatID, sb.String(), logger)
 }
 
 func isAdmin(adminID, chatID int64) (bool, error) {
@@ -788,7 +797,9 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 
 		switch update.Message.Command() {
 		case "start":
-			msg := tgbotapi.NewMessage(chatID,
+			sendText(
+				bot,
+				chatID,
 				"Привет! Команды:\n"+
 					"/bind UserID <email> - привязать пользователя 3x-ui (Admin only)\n"+
 					"/unbind UserID <email> - отвязать пользователя 3x-ui (Admin only)\n"+
@@ -798,12 +809,12 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 					"/usage - статистика за день, неделю и месяц\n"+
 					"/myID - узнать свой UserID\n"+
 					"/today /week /month - текущие периоды\n"+
-					"/yesterday /prevweek /prevmonth - прошлые периоды")
-			bot.Send(msg)
+					"/yesterday /prevweek /prevmonth - прошлые периоды",
+				logger,
+			)
 
 		case "myID":
-			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ваш UserID: %d", chatID))
-			bot.Send(msg)
+			sendText(bot, chatID, fmt.Sprintf("Ваш UserID: %d", chatID), logger)
 
 		case "all":
 			isAdmin, err := isAdmin(adminID, chatID)
@@ -812,8 +823,7 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !isAdmin {
-				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
-				bot.Send(msg)
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
 				continue
 			}
 
@@ -827,17 +837,15 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			keys, err := getBoundUsers(ctx, pgDB, chatID)
 			if err != nil {
 				if err == sql.ErrNoRows {
-					msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind UserID email@example.com")
-					bot.Send(msg)
+					sendText(bot, chatID, "Сначала привяжите пользователя: /bind UserID email@example.com", logger)
 					continue
 				}
 				logger.Error("Failed to get bound user", "chatID", chatID, "error", err)
-				msg := tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже.")
-				bot.Send(msg)
+				sendText(bot, chatID, "Произошла ошибка, попробуйте позже.", logger)
 			}
 
 			if len(keys) == 0 {
-				bot.Send(tgbotapi.NewMessage(chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")"))
+				sendText(bot, chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")", logger)
 				continue
 			}
 
@@ -847,7 +855,7 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 					logger.Error("Failed to format report", "user", userKey, "error", err)
 					continue
 				}
-				bot.Send(tgbotapi.NewMessage(chatID, report))
+				sendText(bot, chatID, report, logger)
 			}
 
 		case "bind":
@@ -857,22 +865,20 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !isAdmin {
-				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
-				bot.Send(msg)
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
 				continue
 			}
 
 			args := update.Message.CommandArguments()
 			if args == "" {
-				msg := tgbotapi.NewMessage(chatID, "Использование: /bind UserID email@example.com")
-				bot.Send(msg)
+				sendText(bot, chatID, "Использование: /bind UserID email@example.com", logger)
 				continue
 			}
 
 			userData := strings.Fields(args)
 			targetChat, err := strconv.ParseInt(userData[0], 10, 64)
 			if err != nil {
-				bot.Send(tgbotapi.NewMessage(chatID, "❌ Первый аргумент должен быть числом (UserID)"))
+				sendText(bot, chatID, "❌ Первый аргумент должен быть числом (UserID)", logger)
 				continue
 			}
 			email := strings.ToLower(strings.TrimSpace(userData[1]))
@@ -891,17 +897,14 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			if err != nil {
 				var pqErr *pq.Error
 				if errors.As(err, &pqErr) && strings.Contains(pqErr.Message, "violates foreign key constraint") {
-					msg := tgbotapi.NewMessage(chatID, "❌ Пользователь не найден в системе 3x-ui")
-					bot.Send(msg)
+					sendText(bot, chatID, "❌ Пользователь не найден в системе 3x-ui", logger)
 					continue
 				}
-				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка привязки: %v", err))
-				bot.Send(msg)
+				sendText(bot, chatID, fmt.Sprintf("Ошибка привязки: %v", err), logger)
 				continue
 			}
 
-			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Привязан пользователь: %s", email))
-			bot.Send(msg)
+			sendText(bot, chatID, fmt.Sprintf("✅ Привязан пользователь: %s", email), logger)
 
 		case "unbind":
 			isAdmin, err := isAdmin(adminID, chatID)
@@ -910,22 +913,20 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !isAdmin {
-				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
-				bot.Send(msg)
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
 				continue
 			}
 
 			args := update.Message.CommandArguments()
 			if args == "" {
-				msg := tgbotapi.NewMessage(chatID, "Использование: /unbind UserID email@example.com")
-				bot.Send(msg)
+				sendText(bot, chatID, "Использование: /unbind UserID email@example.com", logger)
 				continue
 			}
 
 			userData := strings.Fields(args)
 			targetChat, err := strconv.ParseInt(userData[0], 10, 64)
 			if err != nil {
-				bot.Send(tgbotapi.NewMessage(chatID, "❌ Первый аргумент должен быть числом (UserID)"))
+				sendText(bot, chatID, "❌ Первый аргумент должен быть числом (UserID)", logger)
 				continue
 			}
 			email := strings.ToLower(strings.TrimSpace(userData[1]))
@@ -933,18 +934,15 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			res, err := pgDB.ExecContext(ctx, `DELETE FROM bindings WHERE tg_chat_id = $1 AND user_key = $2`, targetChat, email)
 
 			if err != nil {
-				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка отвязки: %v", err))
-				bot.Send(msg)
+				sendText(bot, chatID, fmt.Sprintf("Ошибка отвязки: %v", err), logger)
 				continue
 			}
 
-			var msg tgbotapi.MessageConfig
 			if n, _ := res.RowsAffected(); n == 0 {
-				msg = tgbotapi.NewMessage(chatID, "Привязка не найдена")
+				sendText(bot, chatID, "Привязка не найдена", logger)
 			} else {
-				msg = tgbotapi.NewMessage(chatID, "✅ Пользователь отвязан")
+				sendText(bot, chatID, "✅ Пользователь отвязан", logger)
 			}
-			bot.Send(msg)
 
 		case "renewal":
 			nextTS, _, ok, err := getRenewalState(ctx, pgDB)
@@ -953,7 +951,7 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !ok {
-				bot.Send(tgbotapi.NewMessage(chatID, "Дата продления не задана. Админ: /renewal_set ГГГГ-ММ-ДД"))
+				sendText(bot, chatID, "Дата продления не задана. Админ: /renewal_set ГГГГ-ММ-ДД", logger)
 				continue
 			}
 			d := time.Unix(nextTS, 0)
@@ -961,8 +959,8 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			if daysLeft < 0 {
 				daysLeft = 0
 			}
-			bot.Send(tgbotapi.NewMessage(chatID,
-				fmt.Sprintf("📅 Следующее продление: %s (через %d дн.)", d.Format("02.01.2006"), daysLeft)))
+			sendText(bot, chatID,
+				fmt.Sprintf("📅 Следующее продление: %s (через %d дн.)", d.Format("02.01.2006"), daysLeft), logger)
 
 		case "renewal_set":
 			isAdmin, err := isAdmin(adminID, chatID)
@@ -971,21 +969,21 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !isAdmin {
-				bot.Send(tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды."))
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
 				continue
 			}
 			args := strings.TrimSpace(update.Message.CommandArguments())
 			t, err := parseDate(args)
 			if err != nil {
-				bot.Send(tgbotapi.NewMessage(chatID, "Использование: /renewal_set 2026-09-04 (или 04.09.2026)"))
+				sendText(bot, chatID, "Использование: /renewal_set 2026-09-04 (или 04.09.2026)", logger)
 				continue
 			}
 			if err := setRenewalState(ctx, pgDB, t.Unix(), 0); err != nil {
 				logger.Error("Failed to set renewal date", "error", err)
-				bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка сохранения"))
+				sendText(bot, chatID, "❌ Ошибка сохранения", logger)
 				continue
 			}
-			bot.Send(tgbotapi.NewMessage(chatID, "✅ Дата продления установлена: "+t.Format("02.01.2006")))
+			sendText(bot, chatID, "✅ Дата продления установлена: "+t.Format("02.01.2006"), logger)
 
 		case "today":
 			sendPeriodReport(ctx, bot, pgDB, chatID, "day", 0, logger)
@@ -1006,8 +1004,7 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			sendPeriodReport(ctx, bot, pgDB, chatID, "month", 1, logger)
 
 		default:
-			msg := tgbotapi.NewMessage(chatID, "Неизвестная команда. Используйте /start для списка команд.")
-			bot.Send(msg)
+			sendText(bot, chatID, "Неизвестная команда. Используйте /start для списка команд.", logger)
 		}
 	}
 }
@@ -1020,11 +1017,16 @@ func main() {
 		MaxAge:     28,
 		Compress:   true,
 	}
-	defer logWriter.Close()
 
 	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, logWriter), &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+
+	defer func() {
+		if err := logWriter.Close(); err != nil {
+			logger.Error("Failed to close log writer", "error", err)
+		}
+	}()
 
 	logger.Info("Starting TrafficBot...")
 
@@ -1070,7 +1072,11 @@ func main() {
 		logger.Error("Failed to connect to PostgreSQL", "error", err)
 		os.Exit(1)
 	}
-	defer pgDB.Close()
+	defer func() {
+		if err := pgDB.Close(); err != nil {
+			logger.Error("Failed to close PostgreSQL database", "error", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := pgDB.PingContext(ctx); err != nil {
@@ -1085,7 +1091,11 @@ func main() {
 		logger.Error("Failed to connect to 3x-ui database", "error", err)
 		os.Exit(1)
 	}
-	defer xuiDB.Close()
+	defer func() {
+		if err := xuiDB.Close(); err != nil {
+			logger.Error("Failed to close 3x-ui database", "error", err)
+		}
+	}()
 
 	if err := xuiDB.Ping(); err != nil {
 		logger.Error("Failed to ping 3x-ui database", "error", err)
