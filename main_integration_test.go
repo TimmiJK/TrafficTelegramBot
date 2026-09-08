@@ -46,11 +46,7 @@ func setupPG(t *testing.T) *sql.DB {
 	}
 
 	applyMigrationFiles(t, db)
-	defer func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("failed to close db: %v", err)
-		}
-	}()
+	t.Cleanup(func() { db.Close() })
 	return db
 }
 
