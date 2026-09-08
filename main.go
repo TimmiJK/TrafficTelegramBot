@@ -21,28 +21,32 @@ import (
 )
 
 type Config struct {
-	DBHost       string
-	DBPort       string
-	DBUser       string
-	DBPassword   string
-	DBName       string
-	XUIPath      string
-	BotToken     string
-	PollInterval time.Duration
-	BillingDay   int
+	DBHost         string
+	DBPort         string
+	DBUser         string
+	DBPassword     string
+	DBName         string
+	XUIPath        string
+	BotToken       string
+	PollInterval   time.Duration
+	BillingDay     int
+	RenewalDays    int
+	RenewalChatIDs []int64
 }
 
 func loadConfig() Config {
 	return Config{
-		DBHost:       os.Getenv("DB_HOST"),
-		DBPort:       os.Getenv("DB_PORT"),
-		DBUser:       os.Getenv("DB_USER"),
-		DBPassword:   os.Getenv("DB_PASSWORD"),
-		DBName:       os.Getenv("DB_NAME"),
-		XUIPath:      os.Getenv("XUI_DB_PATH"),
-		BotToken:     os.Getenv("BOT_TOKEN"),
-		PollInterval: envDurationSec("POLL_INTERVAL", 600),
-		BillingDay:   envInt("BILLING_DAY", 29),
+		DBHost:         os.Getenv("DB_HOST"),
+		DBPort:         os.Getenv("DB_PORT"),
+		DBUser:         os.Getenv("DB_USER"),
+		DBPassword:     os.Getenv("DB_PASSWORD"),
+		DBName:         os.Getenv("DB_NAME"),
+		XUIPath:        os.Getenv("XUI_DB_PATH"),
+		BotToken:       os.Getenv("BOT_TOKEN"),
+		PollInterval:   envDurationSec("POLL_INTERVAL", 600),
+		BillingDay:     envInt("BILLING_DAY", 29),
+		RenewalDays:    envInt("RENEWAL_DAYS", 29),
+		RenewalChatIDs: parseChatIDs(os.Getenv("RENEWAL_USER_IDS")),
 	}
 }
 
@@ -96,6 +100,20 @@ func envDurationSec(key string, defaultVal int) time.Duration {
 	return time.Duration(defaultVal) * time.Second
 }
 
+func parseChatIDs(s string) []int64 {
+	var out []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if id, err := strconv.ParseInt(part, 10, 64); err == nil {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 type Traffic struct {
 	Up   int64
 	Down int64
@@ -106,7 +124,9 @@ func fetchAllTraffic(ctx context.Context, xuiDB *sql.DB) (map[string]Traffic, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	result := make(map[string]Traffic)
 	for rows.Next() {
@@ -449,7 +469,9 @@ func getBoundUsers(ctx context.Context, db *sql.DB, chatID int64) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	var keys []string
 	for rows.Next() {
@@ -462,22 +484,26 @@ func getBoundUsers(ctx context.Context, db *sql.DB, chatID int64) ([]string, err
 	return keys, rows.Err()
 }
 
+func sendText(bot *tgbotapi.BotAPI, chatID int64, text string, logger *slog.Logger) {
+	if _, err := bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
+		logger.Error("Failed to send Telegram message", "chat_id", chatID, "error", err)
+	}
+}
+
 func sendPeriodReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, chatID int64, period string, offset int, logger *slog.Logger) {
 	keys, err := getBoundUsers(ctx, pgDB, chatID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
-			bot.Send(msg)
+			sendText(bot, chatID, "Сначала привяжите пользователя: /bind UserID email@example.com", logger)
 			return
 		}
 		logger.Error("Failed to get bound user", "chatID", chatID, "error", err)
-		msg := tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже.")
-		bot.Send(msg)
+		sendText(bot, chatID, "Произошла ошибка, попробуйте позже.", logger)
 		return
 	}
 
 	if len(keys) == 0 {
-		bot.Send(tgbotapi.NewMessage(chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")"))
+		sendText(bot, chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")", logger)
 		return
 	}
 
@@ -506,8 +532,7 @@ func sendPeriodReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, c
 		text := fmt.Sprintf("👤 Пользователь: %s\nПериод: %s\n\n↑ %s\n↓ %s\nΣ %s",
 			userKey, name, ConvertBytes(up), ConvertBytes(down), ConvertBytes(up+down))
 
-		msg := tgbotapi.NewMessage(chatID, text)
-		bot.Send(msg)
+		sendText(bot, chatID, text, logger)
 	}
 }
 
@@ -548,7 +573,9 @@ func getAllGroupsUsage(ctx context.Context, db *sql.DB, startTS, endTS int64) ([
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	var out []groupUsage
 	for rows.Next() {
@@ -564,7 +591,7 @@ func getAllGroupsUsage(ctx context.Context, db *sql.DB, startTS, endTS int64) ([
 func sendAllGroupsReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB, chatID int64, periodKey string, logger *slog.Logger) {
 	p, ok := periodMap[periodKey]
 	if !ok {
-		bot.Send(tgbotapi.NewMessage(chatID, "Неизвестный период. Доступно: today, week, month, yesterday, prevweek, prevmonth"))
+		sendText(bot, chatID, "Неизвестный период. Доступно: today, week, month, yesterday, prevweek, prevmonth", logger)
 		return
 	}
 
@@ -572,11 +599,11 @@ func sendAllGroupsReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB
 	rows, err := getAllGroupsUsage(ctx, pgDB, startTS, endTS)
 	if err != nil {
 		logger.Error("Failed to get all groups usage", "error", err)
-		bot.Send(tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже."))
+		sendText(bot, chatID, "Произошла ошибка, попробуйте позже.", logger)
 		return
 	}
 	if len(rows) == 0 {
-		bot.Send(tgbotapi.NewMessage(chatID, "Нет данных за период"))
+		sendText(bot, chatID, "Нет данных за период", logger)
 		return
 	}
 
@@ -593,7 +620,7 @@ func sendAllGroupsReport(ctx context.Context, bot *tgbotapi.BotAPI, pgDB *sql.DB
 	sb.WriteString(fmt.Sprintf("\nИтого: ↑ %s ↓ %s Σ %s",
 		ConvertBytes(totalUp), ConvertBytes(totalDown), ConvertBytes(totalUp+totalDown)))
 
-	bot.Send(tgbotapi.NewMessage(chatID, sb.String()))
+	sendText(bot, chatID, sb.String(), logger)
 }
 
 func isAdmin(adminID, chatID int64) (bool, error) {
@@ -670,6 +697,93 @@ func limitTrafficAlert(ctx context.Context, bot *tgbotapi.BotAPI, adminID, limit
 	logger.Info("Limit alert sent", "total", total, "percent", percent)
 }
 
+const renewalKey = "renewal"
+
+func getRenewalState(ctx context.Context, db *sql.DB) (nextTS, lastSent int64, ok bool, err error) {
+	err = db.QueryRowContext(ctx,
+		`SELECT period_start, last_sent_ts FROM alert_state WHERE key = $1`, renewalKey,
+	).Scan(&nextTS, &lastSent)
+	if err == sql.ErrNoRows {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return nextTS, lastSent, true, nil
+}
+
+func setRenewalState(ctx context.Context, db *sql.DB, nextTS, lastSent int64) error {
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO alert_state (key, period_start, last_sent_ts)
+		VALUES ('renewal', $1, $2)
+		ON CONFLICT (key) DO UPDATE SET period_start = $1, last_sent_ts = $2`,
+		nextTS, lastSent)
+	return err
+}
+
+func parseDate(s string) (time.Time, error) {
+	for _, layout := range []string{"2006-01-02", "02.01.2006"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("bad date format")
+}
+
+func renewalReminder(ctx context.Context, bot *tgbotapi.BotAPI, cfg Config, pgDB *sql.DB, logger *slog.Logger) {
+	if len(cfg.RenewalChatIDs) == 0 {
+		return
+	}
+	nextTS, lastSent, ok, err := getRenewalState(ctx, pgDB)
+	if err != nil {
+		logger.Error("Failed to read renewal state", "error", err)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	now := time.Now()
+	loc := now.Location()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).Unix()
+
+	if nextTS > todayStart {
+		return
+	}
+	if lastSent == todayStart {
+		return
+	}
+
+	dateStr := time.Unix(nextTS, 0).In(loc).Format("02.01.2006")
+	var text string
+	if nextTS == todayStart {
+		text = fmt.Sprintf("📅 Сегодня день продления сервера (%s)! Скиньте баксы @"+os.Getenv("ADMIN_USER_NAME"), dateStr)
+	}
+
+	sent := 0
+	for _, chatID := range cfg.RenewalChatIDs {
+		if _, err := bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
+			logger.Error("Failed to send renewal reminder", "chatID", chatID, "error", err)
+			continue
+		}
+		sent++
+	}
+	if sent == 0 {
+		return
+	}
+
+	cycle := int64(cfg.RenewalDays) * 24 * 3600
+	next := nextTS
+	for next <= todayStart {
+		next += cycle
+	}
+	if err := setRenewalState(ctx, pgDB, next, todayStart); err != nil {
+		logger.Error("Failed to advance renewal date", "error", err)
+	}
+
+	logger.Info("Renewal reminder sent", "date", dateStr, "next", time.Unix(next, 0).Format("2006-01-02"))
+}
+
 func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI, pgDB *sql.DB, logger *slog.Logger) {
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
@@ -683,20 +797,24 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 
 		switch update.Message.Command() {
 		case "start":
-			msg := tgbotapi.NewMessage(chatID,
+			sendText(
+				bot,
+				chatID,
 				"Привет! Команды:\n"+
-					"/bind chatID <email> - привязать пользователя 3x-ui (Admin only)\n"+
-					"/unbind chatID <email> - отвязать пользователя 3x-ui (Admin only)\n"+
+					"/bind UserID <email> - привязать пользователя 3x-ui (Admin only)\n"+
+					"/unbind UserID <email> - отвязать пользователя 3x-ui (Admin only)\n"+
 					"/all [период] - сводка по всем пользователям (Admin only)\n"+
+					"/renewal_set 2040-05-11(или 11.05.2040) - установка даты продления сервера (Admin only)\n"+
+					"/renewal - дата продления сервера\n"+
 					"/usage - статистика за день, неделю и месяц\n"+
-					"/myID - узнать свой chatID\n"+
+					"/myID - узнать свой UserID\n"+
 					"/today /week /month - текущие периоды\n"+
-					"/yesterday /prevweek /prevmonth - прошлые периоды")
-			bot.Send(msg)
+					"/yesterday /prevweek /prevmonth - прошлые периоды",
+				logger,
+			)
 
 		case "myID":
-			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ваш chatID: %d", chatID))
-			bot.Send(msg)
+			sendText(bot, chatID, fmt.Sprintf("Ваш UserID: %d", chatID), logger)
 
 		case "all":
 			isAdmin, err := isAdmin(adminID, chatID)
@@ -705,8 +823,7 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !isAdmin {
-				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
-				bot.Send(msg)
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
 				continue
 			}
 
@@ -720,17 +837,15 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			keys, err := getBoundUsers(ctx, pgDB, chatID)
 			if err != nil {
 				if err == sql.ErrNoRows {
-					msg := tgbotapi.NewMessage(chatID, "Сначала привяжите пользователя: /bind email@example.com")
-					bot.Send(msg)
+					sendText(bot, chatID, "Сначала привяжите пользователя: /bind UserID email@example.com", logger)
 					continue
 				}
 				logger.Error("Failed to get bound user", "chatID", chatID, "error", err)
-				msg := tgbotapi.NewMessage(chatID, "Произошла ошибка, попробуйте позже.")
-				bot.Send(msg)
+				sendText(bot, chatID, "Произошла ошибка, попробуйте позже.", logger)
 			}
 
 			if len(keys) == 0 {
-				bot.Send(tgbotapi.NewMessage(chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")"))
+				sendText(bot, chatID, "В этом чате нет привязок. Попросите админа сделать /bind (@"+os.Getenv("ADMIN_USER_NAME")+")", logger)
 				continue
 			}
 
@@ -740,7 +855,7 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 					logger.Error("Failed to format report", "user", userKey, "error", err)
 					continue
 				}
-				bot.Send(tgbotapi.NewMessage(chatID, report))
+				sendText(bot, chatID, report, logger)
 			}
 
 		case "bind":
@@ -750,22 +865,20 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !isAdmin {
-				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
-				bot.Send(msg)
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
 				continue
 			}
 
 			args := update.Message.CommandArguments()
 			if args == "" {
-				msg := tgbotapi.NewMessage(chatID, "Использование: /bind chatID email@example.com")
-				bot.Send(msg)
+				sendText(bot, chatID, "Использование: /bind UserID email@example.com", logger)
 				continue
 			}
 
 			userData := strings.Fields(args)
 			targetChat, err := strconv.ParseInt(userData[0], 10, 64)
 			if err != nil {
-				bot.Send(tgbotapi.NewMessage(chatID, "❌ Первый аргумент должен быть числом (chat ID)"))
+				sendText(bot, chatID, "❌ Первый аргумент должен быть числом (UserID)", logger)
 				continue
 			}
 			email := strings.ToLower(strings.TrimSpace(userData[1]))
@@ -784,17 +897,14 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			if err != nil {
 				var pqErr *pq.Error
 				if errors.As(err, &pqErr) && strings.Contains(pqErr.Message, "violates foreign key constraint") {
-					msg := tgbotapi.NewMessage(chatID, "❌ Пользователь не найден в системе 3x-ui")
-					bot.Send(msg)
+					sendText(bot, chatID, "❌ Пользователь не найден в системе 3x-ui", logger)
 					continue
 				}
-				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка привязки: %v", err))
-				bot.Send(msg)
+				sendText(bot, chatID, fmt.Sprintf("Ошибка привязки: %v", err), logger)
 				continue
 			}
 
-			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Привязан пользователь: %s", email))
-			bot.Send(msg)
+			sendText(bot, chatID, fmt.Sprintf("✅ Привязан пользователь: %s", email), logger)
 
 		case "unbind":
 			isAdmin, err := isAdmin(adminID, chatID)
@@ -803,22 +913,20 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 				continue
 			}
 			if !isAdmin {
-				msg := tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этой команды.")
-				bot.Send(msg)
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
 				continue
 			}
 
 			args := update.Message.CommandArguments()
 			if args == "" {
-				msg := tgbotapi.NewMessage(chatID, "Использование: /unbind chatID email@example.com")
-				bot.Send(msg)
+				sendText(bot, chatID, "Использование: /unbind UserID email@example.com", logger)
 				continue
 			}
 
 			userData := strings.Fields(args)
 			targetChat, err := strconv.ParseInt(userData[0], 10, 64)
 			if err != nil {
-				bot.Send(tgbotapi.NewMessage(chatID, "❌ Первый аргумент должен быть числом (chat ID)"))
+				sendText(bot, chatID, "❌ Первый аргумент должен быть числом (UserID)", logger)
 				continue
 			}
 			email := strings.ToLower(strings.TrimSpace(userData[1]))
@@ -826,18 +934,56 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			res, err := pgDB.ExecContext(ctx, `DELETE FROM bindings WHERE tg_chat_id = $1 AND user_key = $2`, targetChat, email)
 
 			if err != nil {
-				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка отвязки: %v", err))
-				bot.Send(msg)
+				sendText(bot, chatID, fmt.Sprintf("Ошибка отвязки: %v", err), logger)
 				continue
 			}
 
-			var msg tgbotapi.MessageConfig
 			if n, _ := res.RowsAffected(); n == 0 {
-				msg = tgbotapi.NewMessage(chatID, "Привязка не найдена")
+				sendText(bot, chatID, "Привязка не найдена", logger)
 			} else {
-				msg = tgbotapi.NewMessage(chatID, "✅ Пользователь отвязан")
+				sendText(bot, chatID, "✅ Пользователь отвязан", logger)
 			}
-			bot.Send(msg)
+
+		case "renewal":
+			nextTS, _, ok, err := getRenewalState(ctx, pgDB)
+			if err != nil {
+				logger.Error("Failed to read renewal state", "error", err)
+				continue
+			}
+			if !ok {
+				sendText(bot, chatID, "Дата продления не задана. Админ: /renewal_set ГГГГ-ММ-ДД", logger)
+				continue
+			}
+			d := time.Unix(nextTS, 0)
+			daysLeft := int(time.Until(d).Hours() / 24)
+			if daysLeft < 0 {
+				daysLeft = 0
+			}
+			sendText(bot, chatID,
+				fmt.Sprintf("📅 Следующее продление: %s (через %d дн.)", d.Format("02.01.2006"), daysLeft), logger)
+
+		case "renewal_set":
+			isAdmin, err := isAdmin(adminID, chatID)
+			if err != nil {
+				logger.Error("Failed to check admin status", "error", err)
+				continue
+			}
+			if !isAdmin {
+				sendText(bot, chatID, "❌ У вас нет прав для выполнения этой команды.", logger)
+				continue
+			}
+			args := strings.TrimSpace(update.Message.CommandArguments())
+			t, err := parseDate(args)
+			if err != nil {
+				sendText(bot, chatID, "Использование: /renewal_set 2026-09-04 (или 04.09.2026)", logger)
+				continue
+			}
+			if err := setRenewalState(ctx, pgDB, t.Unix(), 0); err != nil {
+				logger.Error("Failed to set renewal date", "error", err)
+				sendText(bot, chatID, "❌ Ошибка сохранения", logger)
+				continue
+			}
+			sendText(bot, chatID, "✅ Дата продления установлена: "+t.Format("02.01.2006"), logger)
 
 		case "today":
 			sendPeriodReport(ctx, bot, pgDB, chatID, "day", 0, logger)
@@ -858,8 +1004,7 @@ func handleBotCommands(ctx context.Context, adminID int64, bot *tgbotapi.BotAPI,
 			sendPeriodReport(ctx, bot, pgDB, chatID, "month", 1, logger)
 
 		default:
-			msg := tgbotapi.NewMessage(chatID, "Неизвестная команда. Используйте /start для списка команд.")
-			bot.Send(msg)
+			sendText(bot, chatID, "Неизвестная команда. Используйте /start для списка команд.", logger)
 		}
 	}
 }
@@ -872,11 +1017,16 @@ func main() {
 		MaxAge:     28,
 		Compress:   true,
 	}
-	defer logWriter.Close()
 
 	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, logWriter), &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+
+	defer func() {
+		if err := logWriter.Close(); err != nil {
+			logger.Error("Failed to close log writer", "error", err)
+		}
+	}()
 
 	logger.Info("Starting TrafficBot...")
 
@@ -909,12 +1059,12 @@ func main() {
 			"period_days", billingPeriodDays)
 	}
 
-	adminID, err := strconv.ParseInt(os.Getenv("ADMIN_CHAT_ID"), 10, 64)
+	adminID, err := strconv.ParseInt(os.Getenv("ADMIN_USER_ID"), 10, 64)
 	if err != nil {
-		logger.Warn("ADMIN_CHAT_ID invalid, limit alerts disabled")
+		logger.Warn("ADMIN_USER_ID invalid, limit alerts disabled")
 	}
 	if adminID == 0 {
-		logger.Warn("ADMIN_CHAT_ID not set: /bind and /unbind are disabled")
+		logger.Warn("ADMIN_USER_ID not set: /bind and /unbind are disabled")
 	}
 
 	pgDB, err := NewPostgresDB(cfg)
@@ -922,7 +1072,11 @@ func main() {
 		logger.Error("Failed to connect to PostgreSQL", "error", err)
 		os.Exit(1)
 	}
-	defer pgDB.Close()
+	defer func() {
+		if err := pgDB.Close(); err != nil {
+			logger.Error("Failed to close PostgreSQL database", "error", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := pgDB.PingContext(ctx); err != nil {
@@ -937,7 +1091,11 @@ func main() {
 		logger.Error("Failed to connect to 3x-ui database", "error", err)
 		os.Exit(1)
 	}
-	defer xuiDB.Close()
+	defer func() {
+		if err := xuiDB.Close(); err != nil {
+			logger.Error("Failed to close 3x-ui database", "error", err)
+		}
+	}()
 
 	if err := xuiDB.Ping(); err != nil {
 		logger.Error("Failed to ping 3x-ui database", "error", err)
@@ -983,6 +1141,24 @@ func main() {
 				check()
 			}
 		}()
+	}
+
+	if len(cfg.RenewalChatIDs) > 0 {
+		go func() {
+			check := func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				renewalReminder(ctx, bot, cfg, pgDB, logger)
+				cancel()
+			}
+			check()
+			ticker := time.NewTicker(1 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				check()
+			}
+		}()
+	} else {
+		logger.Warn("RENEWAL_USER_IDS not set: renewal reminders disabled")
 	}
 
 	handleBotCommands(context.Background(), adminID, bot, pgDB, logger)

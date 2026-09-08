@@ -1,0 +1,12 @@
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      - path: '_test\.go'
+        linters:
+          - errcheck
+
+      - linters:
+          - staticcheck
+        text: 'QF1012'
